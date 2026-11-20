@@ -106,12 +106,13 @@ def xirr(flows: list[tuple[date, float]]) -> float | None:
 class Order:
     date: date
     amount: float
-    kind: str  # "SIP" or "Lumpsum"
+    kind: str  # "SIP (Monthly)" or "Lumpsum"
+    plan: str = ""  # "SIP 1", "Lumpsum 2": the row in the fund's plan tables
 
 
 def build_orders(fund: dict, as_of: date) -> list[Order]:
     orders: list[Order] = []
-    for sip in fund.get("sips", []):
+    for i, sip in enumerate(fund.get("sips", []), start=1):
         amount = float(sip.get("amount") or 0)
         start = _to_date(sip.get("start"))
         if amount <= 0 or start is None:
@@ -122,12 +123,12 @@ def build_orders(fund: dict, as_of: date) -> list[Order]:
         freq = sip.get("frequency") or "Monthly"
         for d in sip_dates(start, end, freq):
             amt = amount * (1 + step) ** _full_years(start, d)
-            orders.append(Order(d, round(amt, 2), f"SIP ({freq})"))
-    for ls in fund.get("lumpsums", []):
+            orders.append(Order(d, round(amt, 2), f"SIP ({freq})", f"SIP {i}"))
+    for j, ls in enumerate(fund.get("lumpsums", []), start=1):
         amount = float(ls.get("amount") or 0)
         d = _to_date(ls.get("date"))
         if amount > 0 and d is not None and d <= as_of:
-            orders.append(Order(d, amount, "Lumpsum"))
+            orders.append(Order(d, amount, "Lumpsum", f"Lumpsum {j}"))
     orders.sort(key=lambda o: o.date)
     return orders
 
@@ -169,10 +170,10 @@ def execute_orders(orders: list[Order], nav: pd.Series, as_of: date,
         price = float(nav.iloc[pos])
         net = o.amount * (1 - stamp_duty_pct / 100.0)
         rows.append({
-            "order_date": o.date, "nav_date": nav_date.date(), "kind": o.kind,
+            "order_date": o.date, "nav_date": nav_date.date(), "kind": o.kind, "plan": o.plan,
             "amount": o.amount, "nav": price, "units": net / price,
         })
-    df = pd.DataFrame(rows, columns=["order_date", "nav_date", "kind", "amount", "nav", "units"])
+    df = pd.DataFrame(rows, columns=["order_date", "nav_date", "kind", "plan", "amount", "nav", "units"])
     df["cum_units"] = df["units"].cumsum()
     df["cum_invested"] = df["amount"].cumsum()
     return df, skipped
@@ -229,6 +230,126 @@ def fund_summary_row(r: FundResult, total_value: float) -> dict:
 
 
 # ------------------------------------------------------- time series -------
+INVESTED_SUFFIX = " | invested"
+
+
+def holding_series(tx: pd.DataFrame, nav: pd.Series, idx: pd.DatetimeIndex) -> pd.DataFrame:
+    """Value, invested amount and new money (Flow) of some transactions, on each date of idx."""
+    if tx.empty or len(idx) == 0:
+        return pd.DataFrame({"Value": 0.0, "Invested": 0.0, "Flow": 0.0}, index=idx)
+    by_day = tx.groupby(pd.to_datetime(tx["nav_date"]))[["units", "amount"]].sum()
+    full = idx.union(by_day.index)
+    units = by_day["units"].reindex(full, fill_value=0.0).cumsum().reindex(idx)
+    amt_full = by_day["amount"].reindex(full, fill_value=0.0)
+    invested = amt_full.cumsum().reindex(idx)
+    flow = amt_full.reindex(idx, fill_value=0.0)
+    px_ = nav.reindex(nav.index.union(idx)).ffill().reindex(idx)
+    value = (units * px_).fillna(0.0)
+    return pd.DataFrame({"Value": value, "Invested": invested, "Flow": flow}, index=idx)
+
+
+def pnl_metrics(value: pd.Series, invested: pd.Series) -> dict:
+    """How the money moved: worst loss, gain lost from a peak, time in loss.
+
+    P&L = value - invested. A fall from a peak of P&L is money you saw go away.
+    """
+    mask = invested > 0
+    value, invested = value[mask], invested[mask]
+    if value.empty:
+        return {}
+    pnl = value - invested
+    pnl_pct = pnl / invested * 100
+    peak = pnl.cummax().clip(lower=0)  # a peak gain; before any gain, the peak is 0
+    fall = pnl - peak                   # money lost from the best gain so far (<= 0)
+    in_loss = pnl < 0
+    # longest calendar-day period in loss
+    longest, start, longest_span = 0, None, (None, None)
+    dates = pnl.index
+    for d, loss in zip(dates, in_loss):
+        if loss and start is None:
+            start = d
+        if not loss and start is not None:
+            span = (d - start).days
+            if span > longest:
+                longest, longest_span = span, (start.date(), d.date())
+            start = None
+    if start is not None:
+        span = (dates[-1] - start).days
+        if span > longest:
+            longest, longest_span = span, (start.date(), None)
+    trough = fall.idxmin()
+    peak_date = pnl.loc[:trough].idxmax() if fall.min() < 0 else trough
+    return {
+        "pnl": pnl, "pnl_pct": pnl_pct, "fall": fall,
+        "worst_pnl": float(pnl.min()), "worst_pnl_date": pnl.idxmin().date(),
+        "worst_pnl_pct": float(pnl_pct.min()), "worst_pnl_pct_date": pnl_pct.idxmin().date(),
+        "best_pnl": float(pnl.max()), "best_pnl_date": pnl.idxmax().date(),
+        "biggest_fall": float(fall.min()), "biggest_fall_peak": peak_date.date(),
+        "biggest_fall_trough": trough.date(),
+        "loss_days_pct": float(in_loss.mean() * 100),
+        "longest_loss_days": longest, "longest_loss_span": longest_span,
+        "in_loss_now": bool(in_loss.iloc[-1]),
+    }
+
+
+def instalment_analysis(r: FundResult) -> pd.DataFrame:
+    """For each purchase: value now, return, and the lowest point after the purchase."""
+    tx = r.transactions
+    cols = ["current_value", "gain", "return_pct", "cagr_pct", "lowest_value", "worst_fall_pct",
+            "lowest_on", "days_below_cost", "below_cost_now"]
+    if tx.empty or r.current_nav is None:
+        return tx.assign(**{c: None for c in cols})
+    nav = r.nav[r.nav.index <= pd.Timestamp(r.valuation_date)]
+    nav_v, nav_i = nav.to_numpy(), nav.index
+    out = []
+    for row in tx.itertuples(index=False):
+        pos = nav_i.searchsorted(pd.Timestamp(row.nav_date), side="left")
+        after = nav_v[pos:]
+        cur = row.units * r.current_nav
+        days = (r.valuation_date - row.nav_date).days
+        k = int(after.argmin()) if len(after) else 0
+        low_nav = float(after[k]) if len(after) else row.nav
+        out.append({
+            "current_value": cur,
+            "gain": cur - row.amount,
+            "return_pct": (cur / row.amount - 1) * 100 if row.amount else None,
+            "cagr_pct": ((r.current_nav / row.nav) ** (365.0 / days) - 1) * 100 if days >= 365 else None,
+            "lowest_value": row.units * low_nav,
+            "worst_fall_pct": (low_nav / row.nav - 1) * 100,
+            "lowest_on": nav_i[pos + k].date() if len(after) else row.nav_date,
+            "days_below_cost": int((after < row.nav).sum()),
+            "below_cost_now": r.current_nav < row.nav,
+        })
+    return pd.concat([tx.reset_index(drop=True), pd.DataFrame(out, columns=cols)], axis=1)
+
+
+def plan_summary(r: FundResult) -> list[dict]:
+    """One row for each SIP plan or lumpsum of a fund."""
+    tx = r.transactions
+    if tx.empty or r.current_nav is None:
+        return []
+    upto = r.nav[r.nav.index <= pd.Timestamp(r.valuation_date)]
+    rows = []
+    for plan, g in tx.groupby("plan", sort=False):
+        invested = float(g["amount"].sum())
+        value = float(g["units"].sum()) * r.current_nav
+        flows = [(d, -a) for d, a in zip(g["nav_date"], g["amount"])]
+        x = xirr(flows + [(r.valuation_date, value)])
+        idx = upto.index[upto.index >= pd.Timestamp(g["nav_date"].min())]
+        h = holding_series(g, r.nav, idx)
+        m = pnl_metrics(h["Value"], h["Invested"])
+        rows.append({
+            "Fund": r.name, "Plan": plan, "Type": g["kind"].iloc[0],
+            "From": g["nav_date"].min(), "To": g["nav_date"].max(), "Instalments": len(g),
+            "Invested (₹)": invested, "Current value (₹)": value, "Gain (₹)": value - invested,
+            "Absolute return %": (value / invested - 1) * 100 if invested else None,
+            "XIRR %": x * 100 if x is not None else None,
+            "Lowest P&L (₹)": m.get("worst_pnl"), "Lowest P&L %": m.get("worst_pnl_pct"),
+            "Lowest P&L on": m.get("worst_pnl_date"),
+            "Biggest fall from peak gain (₹)": m.get("biggest_fall"),
+            "Days in loss %": m.get("loss_days_pct"),
+        })
+    return rows
 def value_series(results: list[FundResult], as_of: date) -> pd.DataFrame:
     """Daily (NAV-day) series: invested, value, and value per fund."""
     active = [r for r in results if not r.transactions.empty]
@@ -244,16 +365,12 @@ def value_series(results: list[FundResult], as_of: date) -> pd.DataFrame:
     flows = pd.Series(0.0, index=idx)
     total = pd.Series(0.0, index=idx)
     for r in active:
-        tx = r.transactions
-        by_day = tx.groupby(pd.to_datetime(tx["nav_date"]))[["units", "amount"]].sum()
-        units = by_day["units"].reindex(idx, fill_value=0.0).cumsum()
-        amt = by_day["amount"].reindex(idx, fill_value=0.0)
-        nav = r.nav.reindex(r.nav.index.union(idx)).ffill().reindex(idx)
-        v = (units * nav).fillna(0.0)
-        out[r.name] = v
-        total += v
-        invested += amt.cumsum()
-        flows += amt
+        h = holding_series(r.transactions, r.nav, idx)
+        out[r.name] = h["Value"]
+        out[f"{r.name}{INVESTED_SUFFIX}"] = h["Invested"]
+        total += h["Value"]
+        invested += h["Invested"]
+        flows += h["Flow"]
     out["Invested"] = invested
     out["Value"] = total
     out["Flow"] = flows

@@ -65,3 +65,43 @@ def test_order_on_holiday_uses_next_nav():
     r = engine.simulate_fund(fund, {}, nav, date(2024, 1, 10))
     assert r.transactions["nav_date"].iloc[0] == date(2024, 1, 8)
     assert r.units == pytest.approx(100)
+
+
+def _vshape_nav():
+    # NAV 10 -> falls to 5 -> back to 20, on business days.
+    idx = pd.bdate_range("2021-01-01", "2023-12-29")
+    n = len(idx)
+    third = n // 3
+    import numpy as np
+    vals = np.concatenate([np.linspace(10, 5, third), np.linspace(5, 20, n - third)])
+    return pd.Series(vals, index=idx)
+
+
+def test_plan_labels_and_instalment_analysis():
+    nav = _vshape_nav()
+    fund = {"code": 1, "name": "V", "sips": [{"amount": 1000, "frequency": "Monthly", "start": "2021-01-04"}],
+            "lumpsums": [{"amount": 10000, "date": "2021-01-01"}]}
+    r = engine.simulate_fund(fund, {}, nav, date(2023, 12, 29))
+    assert set(r.transactions["plan"]) == {"SIP 1", "Lumpsum 1"}
+    ia = engine.instalment_analysis(r)
+    first = ia[ia["plan"] == "Lumpsum 1"].iloc[0]
+    assert first["worst_fall_pct"] == pytest.approx(-50, abs=0.5)
+    assert first["lowest_value"] == pytest.approx(5000, rel=0.01)
+    assert first["current_value"] == pytest.approx(20000, rel=0.01)
+    assert not first["below_cost_now"]
+
+
+def test_pnl_metrics_vshape():
+    nav = _vshape_nav()
+    fund = {"code": 1, "name": "V", "sips": [], "lumpsums": [{"amount": 10000, "date": "2021-01-01"}]}
+    r = engine.simulate_fund(fund, {}, nav, date(2023, 12, 29))
+    s = engine.value_series([r], date(2023, 12, 29))
+    m = engine.pnl_metrics(s["Value"], s["Invested"])
+    assert m["worst_pnl"] == pytest.approx(-5000, rel=0.01)
+    assert m["worst_pnl_pct"] == pytest.approx(-50, abs=0.5)
+    assert m["best_pnl"] == pytest.approx(10000, rel=0.01)
+    assert m["biggest_fall"] == pytest.approx(-5000, rel=0.01)  # from 0 gain down to -5000
+    assert not m["in_loss_now"]
+    assert m["longest_loss_days"] > 300
+    rows = engine.plan_summary(r)
+    assert rows[0]["Plan"] == "Lumpsum 1" and rows[0]["Lowest P&L (₹)"] == pytest.approx(-5000, rel=0.01)
