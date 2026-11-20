@@ -21,8 +21,14 @@ The app uses real historical NAV data from [mfapi.in](https://www.mfapi.in/) (AM
    - SIP: amount, frequency (Monthly, Weekly, Fortnightly, Quarterly), start date, end date (optional), annual step-up %.
    - Lumpsum: amount and date. You can add many lumpsums for one fund.
 3. Open **Results** to see the values.
-4. Open **Transactions** to see each purchase. You can download a CSV file.
-5. Push **Save** in the sidebar to keep the portfolio. Use **Load** to open it again.
+4. Open **Relive the journey** to see how your money moved:
+   - Select the whole portfolio, one fund, or one SIP plan or lumpsum.
+   - See the lowest P&L, the biggest fall from a peak gain, and the time in loss.
+   - Move the date slider to see the invested amount, value and P&L on that day.
+   - See each instalment: its value now, its return, and its lowest point after the purchase.
+5. Open **Transactions** to see each purchase with its value now. You can download a CSV file.
+6. Open **Compare** to compare the open portfolio with saved portfolios.
+7. Push **Save** in the sidebar to keep the portfolio. Use **Load** to open it again.
 
 ## Fields in Results
 
@@ -38,6 +44,11 @@ The app uses real historical NAV data from [mfapi.in](https://www.mfapi.in/) (AM
 | Volatility | Annual standard deviation of daily time-weighted returns. |
 | Fund NAV CAGR | Growth of the fund NAV from the first purchase to the valuation date. |
 | Weight % | Part of the total value in each fund. |
+| P&L | Value − invested amount, on a given day. |
+| Lowest P&L | The lowest P&L on any day (the worst loss you saw). |
+| Fall from peak gain | Money lost from the best P&L so far. |
+| Time in loss | Part of NAV days when the value was below the invested amount. |
+| Worst fall % (instalment) | Largest fall of the NAV below the buy NAV after that purchase. |
 
 ## Rules of the simulation
 

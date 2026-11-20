@@ -1,0 +1,19 @@
+{
+  "name": "Index SIP Only",
+  "benchmark": {"code": 120716, "name": "UTI Nifty 50 Index Fund - Direct Plan - Growth"},
+  "stamp_duty": false,
+  "as_of": null,
+  "funds": [
+    {
+      "id": "nifty02",
+      "code": 120716,
+      "name": "UTI Nifty 50 Index Fund - Direct Plan - Growth",
+      "sips": [
+        {"amount": 15000, "frequency": "Monthly", "start": "2020-01-05", "end": null, "step_up_pct": 10}
+      ],
+      "lumpsums": [
+        {"amount": 150000, "date": "2020-03-25"}
+      ]
+    }
+  ]
+}

@@ -57,6 +57,28 @@ def pct(x: float | None, dec: int = 2) -> str:
     return "—" if x is None or pd.isna(x) else f"{x:.{dec}f}%"
 
 
+def fdate(v) -> str:
+    return "—" if v is None or (not isinstance(v, date) and pd.isna(v)) else f"{v:%d-%b-%Y}"
+
+
+def _sign_color(v):
+    if isinstance(v, (int, float)) and not pd.isna(v):
+        return "color: #16a34a" if v > 0 else ("color: #dc2626" if v < 0 else "")
+    return ""
+
+
+def styled(df: pd.DataFrame, money=(), pcts=(), dates=(), num: dict | None = None, signed=()):
+    """Format a table: ₹ amounts in Indian format, %, dates; green/red for signed columns."""
+    fmt = {}
+    fmt.update({c: (lambda v: inr(v)) for c in money if c in df.columns})
+    fmt.update({c: (lambda v: pct(v)) for c in pcts if c in df.columns})
+    fmt.update({c: fdate for c in dates if c in df.columns})
+    fmt.update({k: v for k, v in (num or {}).items() if k in df.columns})
+    sty = df.style.format(fmt)
+    sc = [c for c in signed if c in df.columns]
+    return sty.map(_sign_color, subset=sc) if sc else sty
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def cached_nav(code: int):
     return get_nav(code)
@@ -234,7 +256,8 @@ with st.sidebar:
 
 # ------------------------------------------------------------- main --------
 st.title("📈 Mutual Fund Portfolio Simulator")
-tab_build, tab_result, tab_tx = st.tabs(["🧱 Build portfolio", "📊 Results", "📜 Transactions"])
+tab_build, tab_result, tab_relive, tab_tx, tab_cmp = st.tabs(
+    ["🧱 Build portfolio", "📊 Results", "🎢 Relive the journey", "📜 Transactions", "⚖️ Compare"])
 
 with tab_build:
     st.subheader("Add a fund")
@@ -308,10 +331,11 @@ with tab_build:
 
 
 # ------------------------------------------------------------- compute -----
-results: list[engine.FundResult] = []
-errors: list[str] = []
-with st.spinner("Getting NAV data..."):
-    for fund in pf["funds"]:
+def compute(pf: dict, as_of: date) -> dict:
+    """Simulate one portfolio. Returns all results the pages need."""
+    results: list[engine.FundResult] = []
+    errors: list[str] = []
+    for fund in pf.get("funds", []):
         try:
             meta, nav = cached_nav(fund["code"])
         except NavError as e:
@@ -320,18 +344,33 @@ with st.spinner("Getting NAV data..."):
         results.append(engine.simulate_fund(fund, meta, nav, as_of,
                                             stamp_duty_pct=0.005 if pf.get("stamp_duty") else 0.0))
     bench_nav = None
+    bm = pf.get("benchmark") or DEFAULT_BENCH
     try:
-        _, bench_nav = cached_nav(pf["benchmark"]["code"])
+        _, bench_nav = cached_nav(bm["code"])
     except NavError as e:
         errors.append(f"Benchmark: {e}")
+    active = [r for r in results if not r.transactions.empty]
+    c = {"results": results, "errors": errors, "active": active, "bench_nav": bench_nav,
+         "bench_name": bm["name"], "total_inv": sum(r.invested for r in active),
+         "total_val": sum(r.value for r in active),
+         "flows": [fl for r in active for fl in r.flows]}
+    c["val_date"] = max((r.valuation_date for r in active if r.valuation_date), default=None)
+    c["xirr"] = engine.xirr(c["flows"] + [(c["val_date"], c["total_val"])]) if active and c["val_date"] else None
+    c["bench"] = (engine.benchmark_compare(c["flows"], bench_nav, as_of)
+                  if (bench_nav is not None and c["flows"]) else None)
+    c["series"] = engine.value_series(active, as_of) if active else pd.DataFrame()
+    c["risk"] = engine.risk_metrics(c["series"]) if active else {}
+    c["pnl"] = engine.pnl_metrics(c["series"]["Value"], c["series"]["Invested"]) if active else {}
+    c["first_buy"] = min((r.transactions["nav_date"].min() for r in active), default=None)
+    return c
 
-active = [r for r in results if not r.transactions.empty]
-total_inv = sum(r.invested for r in active)
-total_val = sum(r.value for r in active)
-all_flows = [fl for r in active for fl in r.flows]
-val_date = max((r.valuation_date for r in active if r.valuation_date), default=None)
-port_xirr = engine.xirr(all_flows + [(val_date, total_val)]) if active and val_date else None
-bench = engine.benchmark_compare(all_flows, bench_nav, as_of) if (bench_nav is not None and all_flows) else None
+
+with st.spinner("Getting NAV data..."):
+    C = compute(pf, as_of)
+results, errors, active = C["results"], C["errors"], C["active"]
+bench_nav, bench = C["bench_nav"], C["bench"]
+total_inv, total_val, all_flows = C["total_inv"], C["total_val"], C["flows"]
+val_date, port_xirr = C["val_date"], C["xirr"]
 
 
 with tab_result:
@@ -355,9 +394,7 @@ with tab_result:
         else:
             k[5].metric("Benchmark XIRR", "—")
 
-        series = engine.value_series(active, as_of)
-        risk = engine.risk_metrics(series)
-        first_buy = min(r.transactions["nav_date"].min() for r in active)
+        series, risk, first_buy = C["series"], C["risk"], C["first_buy"]
         hold_days = (val_date - first_buy).days
         k2 = st.columns(6)
         k2[0].metric("Holding period", f"{hold_days // 365}y {(hold_days % 365) // 30}m")
@@ -402,6 +439,19 @@ with tab_result:
                     subset=["Gain (₹)", "Absolute return %", "XIRR %"])
                .apply(lambda r: ["font-weight: 700" if r["Fund"] == "TOTAL" else "" for _ in r], axis=1))
         st.dataframe(sty, width="stretch", hide_index=True)
+
+        # ---- plan table
+        st.subheader("Each SIP plan and lumpsum")
+        st.caption("Plan names match the row numbers in the SIP and lumpsum tables of each fund. "
+                   "Lowest P&L is the lowest point of (value − invested) during the plan.")
+        plans = pd.DataFrame([row for r in active for row in engine.plan_summary(r)])
+        st.dataframe(styled(plans,
+                            money=["Invested (₹)", "Current value (₹)", "Gain (₹)", "Lowest P&L (₹)",
+                                   "Biggest fall from peak gain (₹)"],
+                            pcts=["Absolute return %", "XIRR %", "Lowest P&L %", "Days in loss %"],
+                            dates=["From", "To", "Lowest P&L on"],
+                            signed=["Gain (₹)", "Absolute return %", "XIRR %", "Lowest P&L (₹)", "Lowest P&L %"]),
+                     width="stretch", hide_index=True)
 
         # ---- charts
         c1, c2 = st.columns([2, 1])
@@ -479,27 +529,269 @@ with tab_result:
         if bench and bench["missed"]:
             st.caption(f"Benchmark: {bench['missed']} cash flows were not used (no benchmark NAV on those dates).")
 
+# ------------------------------------------------- per-instalment data -----
+def all_instalments(active: list[engine.FundResult]) -> pd.DataFrame:
+    frames = []
+    for r in active:
+        t = engine.instalment_analysis(r)
+        t.insert(0, "Fund", r.name)
+        frames.append(t)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames).sort_values(["nav_date", "Fund"]).reset_index(drop=True)
+
+
+INST_COLS = {"Fund": "Fund", "plan": "Plan", "kind": "Type", "order_date": "Order date",
+             "nav_date": "NAV date", "amount": "Amount (₹)", "nav": "Buy NAV", "units": "Units",
+             "current_value": "Value now (₹)", "gain": "Gain (₹)", "return_pct": "Return %",
+             "cagr_pct": "CAGR %", "lowest_value": "Lowest value (₹)", "worst_fall_pct": "Worst fall %",
+             "lowest_on": "Lowest on", "days_below_cost": "NAV days below cost",
+             "below_cost_now": "Below cost now", "cum_units": "Total units (fund)",
+             "cum_invested": "Total invested (fund)"}
+
+
+def inst_table(df: pd.DataFrame, cols: list[str]):
+    view = df.rename(columns=INST_COLS)[[INST_COLS[c] for c in cols]]
+    return styled(view,
+                  money=["Amount (₹)", "Value now (₹)", "Gain (₹)", "Lowest value (₹)", "Total invested (fund)"],
+                  pcts=["Return %", "CAGR %", "Worst fall %"],
+                  dates=["Order date", "NAV date", "Lowest on"],
+                  num={"Buy NAV": lambda v: f"{v:,.4f}", "Units": lambda v: f"{v:,.4f}",
+                       "Total units (fund)": lambda v: f"{v:,.4f}",
+                       "Below cost now": lambda v: "Yes" if v else "No"},
+                  signed=["Gain (₹)", "Return %", "CAGR %", "Worst fall %"]), view
+
+
+INST = all_instalments(active)
+
+
+# ------------------------------------------------------------- relive ------
+with tab_relive:
+    if not active:
+        st.info("No transactions yet.")
+    else:
+        series = C["series"]
+        st.markdown("See how your money moved after each purchase. "
+                    "**P&L** is value − invested amount. A **fall from peak gain** is gain that you saw go away.")
+        opts = {"Whole portfolio": ("all", None, None)}
+        for r in active:
+            opts[r.name] = ("fund", r, None)
+            for plan in r.transactions["plan"].unique():
+                opts[f"{r.name} › {plan}"] = ("plan", r, plan)
+        sel = st.selectbox("What to relive", list(opts), key="relive_sel")
+        kind, rsel, plan = opts[sel]
+        if kind == "all":
+            value, invested = series["Value"], series["Invested"]
+            inst = INST
+        elif kind == "fund":
+            value, invested = series[rsel.name], series[rsel.name + engine.INVESTED_SUFFIX]
+            inst = INST[INST["Fund"] == rsel.name]
+        else:
+            g = rsel.transactions[rsel.transactions["plan"] == plan]
+            h = engine.holding_series(g, rsel.nav, series.index)
+            value, invested = h["Value"], h["Invested"]
+            inst = INST[(INST["Fund"] == rsel.name) & (INST["plan"] == plan)]
+        m = engine.pnl_metrics(value, invested)
+        if not m:
+            st.info("No data for this selection.")
+        else:
+            pnl, pnl_pct, fall = m["pnl"], m["pnl_pct"], m["fall"]
+            value, invested = value.loc[pnl.index], invested.loc[pnl.index]
+            k = st.columns(6)
+            k[0].metric("Lowest P&L", inr_short(m["worst_pnl"]), help=f"On {fdate(m['worst_pnl_date'])}")
+            k[1].metric("Lowest P&L %", pct(m["worst_pnl_pct"]), help=f"On {fdate(m['worst_pnl_pct_date'])}")
+            k[2].metric("Biggest fall from peak gain", inr_short(m["biggest_fall"]),
+                        help=f"From {fdate(m['biggest_fall_peak'])} to {fdate(m['biggest_fall_trough'])}")
+            k[3].metric("Best P&L", inr_short(m["best_pnl"]), help=f"On {fdate(m['best_pnl_date'])}")
+            k[4].metric("Time in loss", pct(m["loss_days_pct"], 1), help="Part of NAV days with value below invested.")
+            span = m["longest_loss_span"]
+            k[5].metric("Longest loss period", f"{m['longest_loss_days']} days",
+                        help=f"From {fdate(span[0])} to {fdate(span[1]) if span[1] else 'now'}")
+
+            # Story in short sentences.
+            story = []
+            if m["worst_pnl"] < 0:
+                story.append(f"On **{fdate(m['worst_pnl_date'])}**, your money was **{inr(-m['worst_pnl'])}** "
+                             f"below the amount you invested "
+                             f"({pct(pnl_pct.loc[pd.Timestamp(m['worst_pnl_date'])])}).")
+            else:
+                story.append("Your value was never below the amount you invested.")
+            if m["biggest_fall"] < 0:
+                story.append(f"The largest fall started on **{fdate(m['biggest_fall_peak'])}**. "
+                             f"By **{fdate(m['biggest_fall_trough'])}**, **{inr(-m['biggest_fall'])}** "
+                             f"of value went away, compared with that peak.")
+            story.append(f"Now the P&L is **{inr(pnl.iloc[-1])}** ({pct(pnl_pct.iloc[-1])}).")
+            st.info(" ".join(story))
+
+            # Time travel.
+            d0, d1 = pnl.index[0].date(), pnl.index[-1].date()
+            when = st.slider("Go to a date", min_value=d0, max_value=d1, value=d1, format="DD-MMM-YYYY",
+                             key=f"relive_date_{sel}") if d1 > d0 else d1
+            ts = pnl.index[pnl.index <= pd.Timestamp(when)][-1]
+            w = st.columns(5)
+            w[0].metric(f"Invested on {ts:%d-%b-%Y}", inr_short(invested.loc[ts]), help=inr(invested.loc[ts]))
+            w[1].metric("Value on that day", inr_short(value.loc[ts]), help=inr(value.loc[ts]))
+            w[2].metric("P&L on that day", inr_short(pnl.loc[ts]), delta=pct(pnl_pct.loc[ts]))
+            w[3].metric("Fall from peak gain", inr_short(fall.loc[ts]),
+                        help="How much below the best P&L up to that day.")
+            w[4].metric("P&L now", inr_short(pnl.iloc[-1]),
+                        delta=inr_short(pnl.iloc[-1] - pnl.loc[ts]) + " since that day")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=pnl.index, y=pnl.clip(lower=0), fill="tozeroy", name="Profit",
+                                     line=dict(color="#16a34a", width=1)))
+            fig.add_trace(go.Scatter(x=pnl.index, y=pnl.clip(upper=0), fill="tozeroy", name="Loss",
+                                     line=dict(color="#dc2626", width=1)))
+            fig.add_trace(go.Scatter(x=pnl.index, y=pnl_pct, name="P&L %", yaxis="y2",
+                                     line=dict(color="#94a3b8", width=1, dash="dot")))
+            fig.add_vline(x=ts, line_color="#f59e0b", line_dash="dash")
+            fig.update_layout(title="P&L (value − invested)", hovermode="x unified", height=380,
+                              margin=dict(l=0, r=0, t=40, b=0), yaxis_tickprefix="₹", yaxis_tickformat=",.0f",
+                              yaxis2=dict(overlaying="y", side="right", ticksuffix="%", showgrid=False),
+                              legend=dict(orientation="h", y=-0.15))
+            st.plotly_chart(fig, width="stretch")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                figv = go.Figure()
+                figv.add_trace(go.Scatter(x=invested.index, y=invested, name="Invested",
+                                          line=dict(dash="dot", color="#64748b")))
+                figv.add_trace(go.Scatter(x=value.index, y=value, name="Value", line=dict(color="#2563eb")))
+                figv.add_vline(x=ts, line_color="#f59e0b", line_dash="dash")
+                figv.update_layout(title="Value and invested", hovermode="x unified", height=320,
+                                   margin=dict(l=0, r=0, t=40, b=0), yaxis_tickprefix="₹",
+                                   yaxis_tickformat=",.0f", legend=dict(orientation="h", y=-0.2))
+                st.plotly_chart(figv, width="stretch")
+            with c2:
+                figf = go.Figure(go.Scatter(x=fall.index, y=fall, fill="tozeroy", name="Fall from peak gain",
+                                            line=dict(color="#dc2626", width=1)))
+                figf.add_vline(x=ts, line_color="#f59e0b", line_dash="dash")
+                figf.update_layout(title="Money lost from the best P&L so far", hovermode="x unified",
+                                   height=320, margin=dict(l=0, r=0, t=40, b=0), yaxis_tickprefix="₹",
+                                   yaxis_tickformat=",.0f")
+                st.plotly_chart(figf, width="stretch")
+
+            # Each instalment.
+            st.subheader("Each instalment: value now and lowest point")
+            st.caption("**Worst fall %** is the largest fall of the NAV below your buy NAV after that purchase. "
+                       "**Lowest value** is what that instalment was worth on that day.")
+            figi = go.Figure()
+            figi.add_trace(go.Bar(x=pd.to_datetime(inst["nav_date"]), y=inst["return_pct"], name="Return % now",
+                                  marker_color=["#16a34a" if v >= 0 else "#dc2626" for v in inst["return_pct"]],
+                                  customdata=inst[["Fund", "amount", "current_value"]].to_numpy(),
+                                  hovertemplate="%{x|%d-%b-%Y}<br>%{customdata[0]}<br>Buy ₹%{customdata[1]:,.0f}"
+                                                " → now ₹%{customdata[2]:,.0f}<br>Return %{y:.2f}%<extra></extra>"))
+            figi.add_trace(go.Scatter(x=pd.to_datetime(inst["nav_date"]), y=inst["worst_fall_pct"],
+                                      mode="markers", name="Worst fall % after buy",
+                                      marker=dict(color="#f59e0b", size=5, symbol="triangle-down"),
+                                      hovertemplate="%{x|%d-%b-%Y}<br>Worst fall %{y:.2f}%<extra></extra>"))
+            figi.update_layout(height=360, margin=dict(l=0, r=0, t=10, b=0), yaxis_ticksuffix="%",
+                               hovermode="closest", legend=dict(orientation="h", y=-0.2), bargap=0.1)
+            st.plotly_chart(figi, width="stretch")
+            below = int(inst["below_cost_now"].sum())
+            st.caption(f"{len(inst)} instalments. {below} are below their buy NAV now. "
+                       f"{int((inst['worst_fall_pct'] < 0).sum())} went below their buy NAV at some time.")
+            sty, _ = inst_table(inst, ["Fund", "plan", "nav_date", "amount", "nav", "current_value", "gain",
+                                       "return_pct", "cagr_pct", "lowest_value", "worst_fall_pct", "lowest_on",
+                                       "days_below_cost", "below_cost_now"])
+            st.dataframe(sty, width="stretch", hide_index=True, height=420)
+
+
+# ------------------------------------------------------- transactions ------
 with tab_tx:
     if not active:
         st.info("No transactions yet.")
     else:
-        frames = []
-        for r in active:
-            t = r.transactions.copy()
-            t.insert(0, "Fund", r.name)
-            frames.append(t)
-        tx = pd.concat(frames).sort_values(["nav_date", "Fund"]).reset_index(drop=True)
-        tx = tx.rename(columns={"order_date": "Order date", "nav_date": "NAV date", "kind": "Type",
-                                "amount": "Amount (₹)", "nav": "NAV", "units": "Units",
-                                "cum_units": "Total units (fund)", "cum_invested": "Total invested (fund)"})
-        fsel = st.multiselect("Filter by fund", sorted(tx["Fund"].unique()))
-        view = tx[tx["Fund"].isin(fsel)] if fsel else tx
-        st.dataframe(view, width="stretch", hide_index=True,
-                     column_config={"Amount (₹)": st.column_config.NumberColumn(format="%.2f"),
-                                    "NAV": st.column_config.NumberColumn(format="%.4f"),
-                                    "Units": st.column_config.NumberColumn(format="%.4f"),
-                                    "Total units (fund)": st.column_config.NumberColumn(format="%.4f"),
-                                    "Order date": st.column_config.DateColumn(format="DD-MMM-YYYY"),
-                                    "NAV date": st.column_config.DateColumn(format="DD-MMM-YYYY")})
+        fsel = st.multiselect("Filter by fund", sorted(INST["Fund"].unique()))
+        sub = INST[INST["Fund"].isin(fsel)] if fsel else INST
+        sty, view = inst_table(sub, ["Fund", "plan", "kind", "order_date", "nav_date", "amount", "nav", "units",
+                                     "cum_units", "cum_invested", "current_value", "gain", "return_pct",
+                                     "cagr_pct", "lowest_value", "worst_fall_pct", "lowest_on",
+                                     "below_cost_now"])
+        st.dataframe(sty, width="stretch", hide_index=True, height=560)
         st.download_button("⬇️ Download CSV", view.to_csv(index=False).encode("utf-8"),
                            file_name=f"{pf['name']}_transactions.csv", mime="text/csv")
+
+
+# ------------------------------------------------------------ compare ------
+with tab_cmp:
+    st.markdown("Compare portfolios side by side. All use the valuation date in the sidebar. "
+                "Save a portfolio first to see it here.")
+    cur_label = "\x00open"  # fixed value: the name of the open portfolio can change
+    choices = [cur_label] + storage.list_portfolios()
+    names = {cur_label: "Open portfolio (now)"}
+    picks = st.multiselect("Portfolios to compare", choices, default=choices[:2], key="cmp_picks",
+                           format_func=lambda c: names.get(c, c))
+    if not picks:
+        st.info("Select one or more portfolios.")
+    else:
+        comp = {}
+        with st.spinner("Calculating..."):
+            for p in picks:
+                try:
+                    pfx = pf if p == cur_label else storage.load_portfolio(p)
+                except (OSError, ValueError) as e:
+                    st.error(f"{p}: cannot open file ({e}).")
+                    continue
+                comp[names.get(p, p)] = compute(pfx, as_of)
+        rows = []
+        for p, cx in comp.items():
+            if not cx["active"]:
+                rows.append({"Portfolio": p, "Funds": len(cx["results"])})
+                continue
+            rk, pm, b = cx["risk"], cx["pnl"], cx["bench"]
+            inv, val = cx["total_inv"], cx["total_val"]
+            rows.append({
+                "Portfolio": p, "Funds": len(cx["active"]), "First buy": cx["first_buy"],
+                "Invested (₹)": inv, "Value (₹)": val, "Gain (₹)": val - inv,
+                "Absolute return %": (val / inv - 1) * 100 if inv else None,
+                "XIRR %": cx["xirr"] * 100 if cx["xirr"] is not None else None,
+                "Benchmark XIRR %": b["xirr"] * 100 if b and b["xirr"] is not None else None,
+                "TWR (annual) %": rk["twr_ann"] * 100 if rk.get("twr_ann") is not None else None,
+                "Max drawdown %": rk["max_drawdown"] * 100 if rk else None,
+                "Volatility %": rk["volatility"] * 100 if rk.get("volatility") else None,
+                "Lowest P&L (₹)": pm.get("worst_pnl"), "Lowest P&L %": pm.get("worst_pnl_pct"),
+                "Biggest fall from peak gain (₹)": pm.get("biggest_fall"),
+                "Time in loss %": pm.get("loss_days_pct"),
+            })
+        ctbl = pd.DataFrame(rows)
+        st.dataframe(styled(ctbl,
+                            money=["Invested (₹)", "Value (₹)", "Gain (₹)", "Lowest P&L (₹)",
+                                   "Biggest fall from peak gain (₹)"],
+                            pcts=[c for c in ctbl.columns if c.endswith("%")], dates=["First buy"],
+                            signed=["Gain (₹)", "Absolute return %", "XIRR %", "Lowest P&L (₹)"]),
+                     width="stretch", hide_index=True)
+
+        what = st.radio("Chart", ["Value", "Invested", "P&L (₹)", "P&L %", "Drawdown % (time-weighted)"],
+                        horizontal=True, key="cmp_chart")
+        figc = go.Figure()
+        for p, cx in comp.items():
+            s = cx["series"]
+            if s.empty:
+                continue
+            if what == "Value":
+                y = s["Value"]
+            elif what == "Invested":
+                y = s["Invested"]
+            elif what == "P&L (₹)":
+                y = s["Value"] - s["Invested"]
+            elif what == "P&L %":
+                y = (s["Value"] / s["Invested"] - 1) * 100
+            else:
+                y = cx["risk"]["drawdown"] * 100 if cx["risk"] else None
+            if y is not None:
+                figc.add_trace(go.Scatter(x=y.index, y=y, name=p))
+        money_chart = what in ("Value", "Invested", "P&L (₹)")
+        figc.update_layout(hovermode="x unified", height=430, margin=dict(l=0, r=0, t=10, b=0),
+                           yaxis_tickprefix="₹" if money_chart else "",
+                           yaxis_ticksuffix="" if money_chart else "%",
+                           yaxis_tickformat=",.0f" if money_chart else ",.1f",
+                           legend=dict(orientation="h", y=-0.15))
+        st.plotly_chart(figc, width="stretch")
+
+        bar_cols = [c for c in ["XIRR %", "Benchmark XIRR %", "TWR (annual) %"] if c in ctbl.columns]
+        if bar_cols:
+            bars = ctbl.melt(id_vars="Portfolio", value_vars=bar_cols, var_name="Measure", value_name="%")
+            figb = px.bar(bars, x="Portfolio", y="%", color="Measure", barmode="group", text_auto=".2f")
+            figb.update_layout(height=360, margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(figb, width="stretch")
