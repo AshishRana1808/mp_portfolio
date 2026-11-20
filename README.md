@@ -5,13 +5,17 @@ The app uses real historical NAV data from [mfapi.in](https://www.mfapi.in/) (AM
 
 ## Install
 
-1. Open PowerShell in this folder.
-2. Make a virtual environment: `python -m venv .venv`
-3. Install the packages: `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`
+This project uses [uv](https://docs.astral.sh/uv/) to manage Python and the packages.
+
+1. Install uv, if you do not have it: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+2. Open PowerShell in this folder.
+3. Install the packages: `uv sync`
+   - uv makes the `.venv` folder and installs the versions in `uv.lock`.
+   - uv gets Python 3.12 or later if it is not on your computer.
 
 ## Start the app
 
-1. Run: `.\.venv\Scripts\python.exe -m streamlit run app.py`
+1. Run: `uv run streamlit run app.py`
 2. Open http://localhost:8501 in your browser.
 
 ## Use the app
@@ -62,4 +66,13 @@ The app uses real historical NAV data from [mfapi.in](https://www.mfapi.in/) (AM
 
 ## Tests
 
-Run: `.\.venv\Scripts\python.exe -m pytest -q`
+Run: `uv run pytest -q`
+
+## Change the packages
+
+- Add a package: `uv add <name>`
+- Add a package for development only: `uv add --dev <name>`
+- Remove a package: `uv remove <name>`
+- Update all packages in the lock file: `uv lock --upgrade`, then `uv sync`
+
+Commit `pyproject.toml` and `uv.lock` after each change.
