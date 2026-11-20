@@ -1,0 +1,29 @@
+{
+  "name": "Sample Portfolio",
+  "benchmark": {"code": 120716, "name": "UTI Nifty 50 Index Fund - Direct Plan - Growth"},
+  "stamp_duty": false,
+  "as_of": null,
+  "funds": [
+    {
+      "id": "ppfas01",
+      "code": 122639,
+      "name": "Parag Parikh Flexi Cap Fund - Direct Plan - Growth",
+      "sips": [
+        {"amount": 10000, "frequency": "Monthly", "start": "2020-01-05", "end": null, "step_up_pct": 10}
+      ],
+      "lumpsums": [
+        {"amount": 100000, "date": "2020-03-25"},
+        {"amount": 50000, "date": "2022-06-17"}
+      ]
+    },
+    {
+      "id": "nifty01",
+      "code": 120716,
+      "name": "UTI Nifty 50 Index Fund - Direct Plan - Growth",
+      "sips": [
+        {"amount": 2500, "frequency": "Weekly", "start": "2021-01-04", "end": "2024-12-31", "step_up_pct": 0}
+      ],
+      "lumpsums": []
+    }
+  ]
+}
