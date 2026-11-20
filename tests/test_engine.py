@@ -105,3 +105,11 @@ def test_pnl_metrics_vshape():
     assert m["longest_loss_days"] > 300
     rows = engine.plan_summary(r)
     assert rows[0]["Plan"] == "Lumpsum 1" and rows[0]["Lowest P&L (₹)"] == pytest.approx(-5000, rel=0.01)
+
+
+def test_units_value_series():
+    idx = pd.DatetimeIndex(["2024-01-01", "2024-01-02", "2024-01-03"])
+    nav_a = pd.Series([10.0, 12.0], index=pd.DatetimeIndex(["2024-01-01", "2024-01-03"]))  # gap is filled
+    nav_b = pd.Series([1.0, 2.0, 3.0], index=idx)
+    s = engine.units_value_series([(5, nav_a), (10, nav_b)], idx)
+    assert list(s) == [60.0, 70.0, 90.0]

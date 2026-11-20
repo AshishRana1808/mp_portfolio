@@ -651,6 +651,59 @@ with tab_relive:
                               legend=dict(orientation="h", y=-0.15))
             st.plotly_chart(fig, width="stretch")
 
+            # Value against a straight line at today's invested amount.
+            st.subheader("Value against your investment today")
+            mode = st.radio(
+                "Value line", ["Actual value on each day", "Today's units at past NAV"], horizontal=True,
+                key=f"line_mode_{sel}",
+                help="Actual value: what the holding was worth on that day. "
+                     "Today's units at past NAV: what your current holding would be worth on that day. "
+                     "Use it to see the falls your full investment can see.")
+            st.caption("The dashed line is the total amount you invested up to the last date. "
+                       "Green: value is above this line. Red: value is below this line. "
+                       + ("Early in a SIP, the value is low because you invested less money then."
+                          if mode.startswith("Actual") else
+                          "This line shows what all your units of today were worth on each past day."))
+            if mode.startswith("Actual"):
+                vline = value
+            else:
+                if kind == "all":
+                    holdings = [(r.units, r.nav) for r in active]
+                elif kind == "fund":
+                    holdings = [(rsel.units, rsel.nav)]
+                else:
+                    holdings = [(float(g["units"].sum()), rsel.nav)]
+                vline = engine.units_value_series(holdings, value.index)
+            inv_now = float(invested.iloc[-1])
+            base = pd.Series(inv_now, index=vline.index)
+            figs = go.Figure()
+            figs.add_trace(go.Scatter(x=base.index, y=base, line=dict(width=0), showlegend=False, hoverinfo="skip"))
+            figs.add_trace(go.Scatter(x=vline.index, y=vline.clip(lower=inv_now), fill="tonexty", name="Above",
+                                      fillcolor="rgba(22,163,74,0.30)", line=dict(width=0), hoverinfo="skip"))
+            figs.add_trace(go.Scatter(x=base.index, y=base, line=dict(width=0), showlegend=False, hoverinfo="skip"))
+            figs.add_trace(go.Scatter(x=vline.index, y=vline.clip(upper=inv_now), fill="tonexty", name="Below",
+                                      fillcolor="rgba(220,38,38,0.35)", line=dict(width=0), hoverinfo="skip"))
+            figs.add_trace(go.Scatter(x=base.index, y=base, name=f"Invested now: {inr(inv_now)}",
+                                      line=dict(color="#a855f7", width=2, dash="dash"),
+                                      hovertemplate="Invested now ₹%{y:,.0f}<extra></extra>"))
+            figs.add_trace(go.Scatter(x=vline.index, y=vline, name="Value", line=dict(color="#3b82f6", width=2),
+                                      customdata=((vline / inv_now - 1) * 100).to_numpy(),
+                                      hovertemplate="Value ₹%{y:,.0f} (%{customdata:+.2f}% vs invested now)"
+                                                    "<extra></extra>"))
+            figs.add_vline(x=ts, line_color="#f59e0b", line_dash="dash")
+            figs.update_layout(hovermode="x unified", height=400, margin=dict(l=0, r=0, t=10, b=0),
+                               yaxis_tickprefix="₹", yaxis_tickformat=",.0f", legend=dict(orientation="h", y=-0.15))
+            st.plotly_chart(figs, width="stretch")
+            gap = vline - inv_now
+            s = st.columns(4)
+            s[0].metric("Days above the line", pct(float((gap >= 0).mean() * 100), 1))
+            s[1].metric("Most below the line", inr_short(float(gap.min())),
+                        delta=pct(float(gap.min() / inv_now * 100)), help=f"On {fdate(gap.idxmin().date())}")
+            s[2].metric("Most above the line", inr_short(float(gap.max())),
+                        delta=pct(float(gap.max() / inv_now * 100)), help=f"On {fdate(gap.idxmax().date())}")
+            s[3].metric(f"On {ts:%d-%b-%Y}", inr_short(float(vline.loc[ts])),
+                        delta=pct(float(gap.loc[ts] / inv_now * 100)) + " vs invested now")
+
             c1, c2 = st.columns(2)
             with c1:
                 figv = go.Figure()

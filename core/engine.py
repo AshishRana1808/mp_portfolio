@@ -248,6 +248,18 @@ def holding_series(tx: pd.DataFrame, nav: pd.Series, idx: pd.DatetimeIndex) -> p
     return pd.DataFrame({"Value": value, "Invested": invested, "Flow": flow}, index=idx)
 
 
+def units_value_series(holdings: list[tuple[float, pd.Series]], idx: pd.DatetimeIndex) -> pd.Series:
+    """Value on each date of idx of fixed units: [(units, nav series), ...].
+
+    Use it with the units held today to see what today's holding was worth on past days.
+    """
+    total = pd.Series(0.0, index=idx)
+    for units, nav in holdings:
+        px_ = nav.reindex(nav.index.union(idx)).ffill().reindex(idx)
+        total += (units * px_).fillna(0.0)
+    return total
+
+
 def pnl_metrics(value: pd.Series, invested: pd.Series) -> dict:
     """How the money moved: worst loss, gain lost from a peak, time in loss.
 
